@@ -45,7 +45,7 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
     /// @inheritdoc IUniswapV3PoolImmutables
     address public immutable override token1;
     /// @inheritdoc IUniswapV3PoolImmutables
-    uint24 public immutable override fee;
+    uint24 public override fee;
 
     /// @inheritdoc IUniswapV3PoolImmutables
     int24 public immutable override tickSpacing;
@@ -118,8 +118,8 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
         int24 _tickSpacing;
         (factory, token0, token1, fee, _tickSpacing) = IUniswapV3PoolDeployer(msg.sender).parameters();
         tickSpacing = _tickSpacing;
-
         maxLiquidityPerTick = Tick.tickSpacingToMaxLiquidityPerTick(_tickSpacing);
+        baseFee = fee;
     }
 
     /// @dev Common checks for valid tick inputs.
@@ -611,6 +611,12 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
                 : sqrtPriceLimitX96 > slot0Start.sqrtPriceX96 && sqrtPriceLimitX96 < TickMath.MAX_SQRT_RATIO,
             'SPL'
         );
+        
+        fee  = getFee(zeroForOne);
+        if (dynamicFeeData.lastRecordedBlock != block.number) {
+            dynamicFeeData.lastRecordedBlock = uint96(block.number);
+            dynamicFeeData.lastRecordedSqrtPriceX96 = slot0.sqrtPriceX96;
+        }
 
         slot0.unlocked = false;
 
@@ -787,52 +793,6 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
         slot0.unlocked = true;
     }
 
-    /// @inheritdoc IUniswapV3PoolActions
-    function flash(
-        address recipient,
-        uint256 amount0,
-        uint256 amount1,
-        bytes calldata data
-    ) external override lock noDelegateCall {
-        uint128 _liquidity = liquidity;
-        require(_liquidity > 0, 'L');
-
-        uint256 fee0 = FullMath.mulDivRoundingUp(amount0, fee, 1e6);
-        uint256 fee1 = FullMath.mulDivRoundingUp(amount1, fee, 1e6);
-        uint256 balance0Before = balance0();
-        uint256 balance1Before = balance1();
-
-        if (amount0 > 0) TransferHelper.safeTransfer(token0, recipient, amount0);
-        if (amount1 > 0) TransferHelper.safeTransfer(token1, recipient, amount1);
-
-        IUniswapV3FlashCallback(msg.sender).uniswapV3FlashCallback(fee0, fee1, data);
-
-        uint256 balance0After = balance0();
-        uint256 balance1After = balance1();
-
-        require(balance0Before.add(fee0) <= balance0After, 'F0');
-        require(balance1Before.add(fee1) <= balance1After, 'F1');
-
-        // sub is safe because we know balanceAfter is gt balanceBefore by at least fee
-        uint256 paid0 = balance0After - balance0Before;
-        uint256 paid1 = balance1After - balance1Before;
-
-        if (paid0 > 0) {
-            uint8 feeProtocol0 = slot0.feeProtocol % 16;
-            uint256 fees0 = feeProtocol0 == 0 ? 0 : paid0 / feeProtocol0;
-            if (uint128(fees0) > 0) protocolFees.token0 += uint128(fees0);
-            feeGrowthGlobal0X128 += FullMath.mulDiv(paid0 - fees0, FixedPoint128.Q128, _liquidity);
-        }
-        if (paid1 > 0) {
-            uint8 feeProtocol1 = slot0.feeProtocol >> 4;
-            uint256 fees1 = feeProtocol1 == 0 ? 0 : paid1 / feeProtocol1;
-            if (uint128(fees1) > 0) protocolFees.token1 += uint128(fees1);
-            feeGrowthGlobal1X128 += FullMath.mulDiv(paid1 - fees1, FixedPoint128.Q128, _liquidity);
-        }
-
-        emit Flash(msg.sender, recipient, amount0, amount1, paid0, paid1);
-    }
-
     /// @inheritdoc IUniswapV3PoolOwnerActions
     function setFeeProtocol(uint8 feeProtocol0, uint8 feeProtocol1) external override lock onlyFactoryOwner {
         require(
@@ -865,5 +825,49 @@ contract UniswapV3Pool is IUniswapV3Pool, NoDelegateCall {
         }
 
         emit CollectProtocol(msg.sender, recipient, amount0, amount1);
+    }
+
+    bool public /* immutable */ dynamicFeeEnabled;
+    uint24 public baseFee;
+
+    struct DynamicFeeData {
+        uint96 lastRecordedBlock;
+        uint160 lastRecordedSqrtPriceX96;
+    }
+
+    DynamicFeeData public dynamicFeeData;
+
+    function getFee(bool zeroForOne) public view returns (uint24) {
+        if (!dynamicFeeEnabled) return (fee);
+        return _getDynamicFee(zeroForOne);
+    }
+
+    function enableDynamicFee(bool enabled) external onlyFactoryOwner {
+        dynamicFeeEnabled = enabled;
+    }
+
+    function _getDynamicFee(bool zeroForOne) internal view returns (uint24 _fee) {
+        uint256 changeInPricePercentage;
+        if (dynamicFeeData.lastRecordedSqrtPriceX96 == 0) {
+            return baseFee;
+        } else {
+            if (slot0.sqrtPriceX96 > dynamicFeeData.lastRecordedSqrtPriceX96) {
+                changeInPricePercentage = FullMath.mulDiv(
+                    uint256(slot0.sqrtPriceX96)**2 - uint256(dynamicFeeData.lastRecordedSqrtPriceX96)**2,
+                    1e6,
+                    uint256(dynamicFeeData.lastRecordedSqrtPriceX96)**2
+                );
+                uint256 feeChange = (uint256(baseFee) * 9e5 * changeInPricePercentage) / 1e12;
+                _fee = zeroForOne ? uint24(baseFee > feeChange ? (uint256(baseFee) - feeChange) :  baseFee / 10) : uint24(uint256(baseFee) + feeChange);
+            } else {
+                changeInPricePercentage = FullMath.mulDiv(
+                    uint256(dynamicFeeData.lastRecordedSqrtPriceX96)**2 - uint256(slot0.sqrtPriceX96)**2,
+                    1e6,
+                    uint256(dynamicFeeData.lastRecordedSqrtPriceX96)**2
+                );
+                uint256 feeChange = (uint256(baseFee) * 9e5 * changeInPricePercentage) / 1e12;
+                _fee = zeroForOne ? uint24(uint256(baseFee) + feeChange) : uint24(baseFee > feeChange ? (uint256(baseFee) - feeChange) :  baseFee / 10);
+            }
+        }
     }
 }
