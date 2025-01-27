@@ -83,4 +83,4 @@ Removing flash loans frees up the necessary space for dynamic fee logic while ma
 
 ## References
 
-Add a reference to [Nezlobin's tweet link here](https://x.com/0x94305/status/1674857993740111872).
+[Nezlobin's tweet](https://x.com/0x94305/status/1674857993740111872).
