@@ -67,9 +67,7 @@ The dynamic fee is calculated as follows:
 
 ## Changes Made to Accommodate Contract Size
 
-Due to EVM contract size limitations, the **flash loan feature** had to be removed to integrate the dynamic fee mechanism. The flash loan functionality was deemed non-essential compared to the potential benefits of a dynamic fee structure. 
-
-Removing flash loans frees up the necessary space for dynamic fee logic while maintaining a robust and efficient trading mechanism. 
+Due to EVM contract size limitations, the **flash loan feature** had to be removed to integrate the dynamic fee mechanism.
 
 ---
 
